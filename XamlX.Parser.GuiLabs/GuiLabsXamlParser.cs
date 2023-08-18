@@ -1,6 +1,7 @@
 ﻿using Microsoft.Language.Xml;
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using System.Xml;
@@ -174,6 +175,7 @@ namespace XamlX.Parsers
                 }
 
                 // Do not apply XAML whitespace normalization to attribute values
+                // TODO: need to unescape &#10;&#9; like values
                 return new XamlAstTextNode(info, ext, true);
             }
 
@@ -277,76 +279,172 @@ namespace XamlX.Parsers
                     }
                 }
 
-                foreach (var newNode in newEl.Elements)
+                var children = newEl.AsSyntaxElement?.Content ?? newEl.Elements.OfType<SyntaxNode>();
+                var lastItemWasIgnored = false;
+
+                foreach (var child in children)
                 {
-                    (string nodeNs, string nodePrefix, string nodeName) = _ns.GetNsFromName(newNode.Name);
-                    if (_ns.IsIgnorable(nodeNs))
+                    if (child is IXmlElement newNode)
                     {
-                        continue;
-                    }
+                        (string nodeNs, string nodePrefix, string nodeName) = _ns.GetNsFromName(newNode.Name);
 
-                   if (nodeName.Contains("."))
-                    {
-                        if (newNode.Attributes.Any())
-                            throw ParseError(newNode.AsLi(_text), "Attributes aren't allowed on element properties");
-                        var pair = nodeName.Split(new[] { '.' }, 2);
-                        i.Children.Add(new XamlAstXamlPropertyValueNode(newEl.AsLi(_text), new XamlAstNamePropertyReference
-                            (
-                                newEl.AsLi(_text),
-                                new XamlAstXmlTypeReference(newEl.AsLi(_text), nodeNs,
-                                    pair[0]), pair[1], type
-                            ),
-                            ParseValueNodeChildren(newNode, spaceMode),
-                            false
-                        ));
-                    }
-                    else
-                    {
-                        i.Children.Add(ParseNewInstance(newNode, false, spaceMode));
-                    }
+                        if (TryGetNodeFromLeadingTrivia(newNode, out var leadingTrivia, spaceMode))
+                        {
+                            i.Children.Add(leadingTrivia);
+                        }
 
+                        if (!_ns.IsIgnorable(nodeNs))
+                        {
+                            if (nodeName.Contains("."))
+                            {
+                                if (newNode.Attributes.Any())
+                                    throw ParseError(newNode.AsLi(_text),
+                                        "Attributes aren't allowed on element properties");
+                                var pair = nodeName.Split(new[] { '.' }, 2);
+                                i.Children.Add(new XamlAstXamlPropertyValueNode(newEl.AsLi(_text),
+                                    new XamlAstNamePropertyReference
+                                    (
+                                        newEl.AsLi(_text),
+                                        new XamlAstXmlTypeReference(newEl.AsLi(_text), nodeNs,
+                                            pair[0]), pair[1], type
+                                    ),
+                                    ParseValueNodeChildren(newNode, spaceMode),
+                                    false
+                                ));
+                            }
+                            else
+                            {
+                                i.Children.Add(ParseNewInstance(newNode, false, spaceMode));
+                            }
+                        }
+                        else
+                        {
+                            /*
+                             Consider following XML:
+<Root xmlns='rootns' xmlns:mc='http://schemas.openxmlformats.org/markup-compatibility/2006' 
+    mc:Ignorable='d d2' xmlns:d='test' xmlns:d2='test2'
+    d:DataContext='123' d2:Lalala='321'>
+    <d:DesignWidth>test</d:DesignWidth>
+</Root>
+                           If <d:DesignWidth> is ignored, then parser should return "\n    " (before ignored element) and and "\n" (right after ignored element).
+                           BUT it's not how normal XML parser behaves, instead it returns only "\n     " text node.
+                           Adding this hack to match .NET XML parser.  
+                             */
+                            lastItemWasIgnored = true;
+                        }
+
+                        if (TryGetNodeFromTrailingTrivia(newNode, out var trailingTrivia, spaceMode))
+                        {
+                            i.Children.Add(trailingTrivia);
+                        }
+                    }
+                    else if (child is XmlCommentSyntax commentSyntax)
+                    {
+                        if (TryGetNodeFromLeadingTrivia(commentSyntax, out var commentLeadingTrivia, spaceMode))
+                        {
+                            i.Children.Add(commentLeadingTrivia);
+                        }
+                    }
+                    else if (child is XmlTextSyntax textSyntax)
+                    {
+                        var preserveWhitespace = spaceMode == XmlSpace.Preserve;
+                        string text = UnescapeXml(textSyntax.Value);
+                        i.Children.Add(new XamlAstTextNode(textSyntax.AsLi(_text), text, preserveWhitespace));
+                    }
                 }
-
-                if (TryParseText(newEl, out var textNode, spaceMode))
+                
+                if (!lastItemWasIgnored
+                    && TryGetNodeFromLeadingTrivia((newEl as XmlElementSyntax)?.EndTag, out var endTagLeadingTrivia, spaceMode))
                 {
-                    i.Children.Add(textNode);
+                    i.Children.Add(endTagLeadingTrivia);
                 }
 
                 return i;
+            }
+
+            bool TryGetNodeFromLeadingTrivia(object node, out IXamlAstValueNode value, XmlSpace spaceMode)
+            {
+                if (node is SyntaxNode { HasLeadingTrivia: true } syntax
+                    && TryParseText(syntax, syntax.GetLeadingTrivia(), out var trivia, spaceMode))
+                {
+                    value = trivia;
+                    return true;
+                }
+
+                value = null;
+                return false;
+            }
+            
+            bool TryGetNodeFromTrailingTrivia(object node, out IXamlAstValueNode value, XmlSpace spaceMode)
+            {
+                if (node is SyntaxNode { HasTrailingTrivia: true } syntax
+                    && TryParseText(syntax, syntax.GetTrailingTrivia(), out var trivia, spaceMode))
+                {
+                    value = trivia;
+                    return true;
+                }
+
+                value = null;
+                return false;
             }
 
             List<IXamlAstValueNode> ParseValueNodeChildren(IXmlElement newParent, XmlSpace spaceMode)
             {
                 var lst = new List<IXamlAstValueNode>();
 
-                if (TryParseText(newParent, out var node, spaceMode))
+                var children = (IEnumerable<object>)newParent.AsSyntaxElement?.Content ?? newParent.Elements;
+                foreach (var child in children)
                 {
-                    lst.Add(node);
-                }
-                else
-                {
-                    foreach (var newNode in newParent.Elements)
+                    if (child is IXmlElement newNode)
                     {
+                        if (TryGetNodeFromLeadingTrivia(newNode, out var leadingTrivia, spaceMode))
+                        {
+                            lst.Add(leadingTrivia);
+                        }
+
                         lst.Add(ParseNewInstance(newNode, false, spaceMode));
+
+                        if (TryGetNodeFromTrailingTrivia(newNode, out var trailingTrivia, spaceMode))
+                        {
+                            lst.Add(trailingTrivia);
+                        }
                     }
+                    else if (child is XmlCommentSyntax commentSyntax)
+                    {
+                        if (TryGetNodeFromLeadingTrivia(commentSyntax, out var commentLeadingTrivia, spaceMode))
+                        {
+                            lst.Add(commentLeadingTrivia);
+                        }
+                    }
+                    else if (child is XmlTextSyntax textSyntax)
+                    {
+                        var preserveWhitespace = spaceMode == XmlSpace.Preserve;
+                        string text = UnescapeXml(textSyntax.Value);
+                        lst.Add(new XamlAstTextNode(textSyntax.AsLi(_text), text, preserveWhitespace));
+                    }
+                }
+                if ((newParent as XmlElementSyntax)?.EndTag is SyntaxNode { HasLeadingTrivia: true } endTagSyntax
+                    && TryParseText(endTagSyntax, endTagSyntax.GetLeadingTrivia(), out var endTagLeadingTrivia,
+                        spaceMode))
+                {
+                    lst.Add(endTagLeadingTrivia);
                 }
                 return lst;
             }
 
-            public bool TryParseText(IXmlElement element, out IXamlAstValueNode node, XmlSpace spaceMode)
+            public bool TryParseText(SyntaxNode element, SyntaxTriviaList trivia, out IXamlAstValueNode node, XmlSpace spaceMode)
             {
-                if (element != null && element.AsSyntaxElement.Content.Count == 1 && element.AsSyntaxElement.Content[0] is XmlTextSyntax textContent)
+                if (trivia.Count > 0)
                 {
                     var preserveWhitespace = spaceMode == XmlSpace.Preserve;
-                    string text = UnescapeXml(textContent.Value);
-                    node = new XamlAstTextNode(textContent.AsLi(_text), text, preserveWhitespace);
+                    // TODO: no idea if it's the best way to convert trivia list to string
+                    string text = string.Concat(trivia.Select(n => n.Text)).Replace("\r\n", "\n");
+                    node = new XamlAstTextNode(element.AsLi(_text), text, preserveWhitespace);
                     return true;
                 }
                 node = null;
                 return false;
             }
-
-
 
             private string UnescapeXml(string input, bool preserveNewlines = true)
             {
